@@ -1,0 +1,27 @@
+import express from 'express';
+import {createServer} from 'node:http';
+import {WebSocketServer,WebSocket} from 'ws';
+import {randomBytes,randomUUID} from 'node:crypto';
+const app=express();app.use(express.static('public'));const server=createServer(app);const wss=new WebSocketServer({server,path:'/ws'});
+const rooms=new Map();
+const bank={영화제목:['기생충','겨울왕국','타이타닉','해리포터','어벤져스','부산행','토이스토리','라이온 킹','인터스텔라','극한직업','라라랜드','인사이드 아웃'],스포츠:['축구','농구','야구','배드민턴','탁구','양궁','스키','수영','볼링','태권도','펜싱','배구'],과일:['딸기','수박','포도','바나나','파인애플','망고','복숭아','체리','귤','키위','석류','멜론'],연예인:['아이유','유재석','지드래곤','장원영','카리나','박보검','마동석','제니','이효리','공유','차은우','봉준호'],유명인사:['손흥민','김연아','이순신','세종대왕','아인슈타인','스티브 잡스','일론 머스크','테일러 스위프트','마이클 잭슨','레오나르도 다빈치','마리 퀴리','호날두']};
+const words=Object.entries(bank).flatMap(([category,list])=>list.map(word=>({category,word})));
+const send=(ws,obj)=>{if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify(obj))};
+const broadcast=(room,obj)=>{for(const p of room.players)send(p.ws,obj)};
+const norm=s=>s.normalize('NFKC').replace(/\s/g,'').toLocaleLowerCase('ko');
+const publicPlayers=r=>r.players.map(p=>({id:p.id,nick:p.nick,avatar:p.avatar,score:p.score}));
+function sync(r){broadcast(r,{type:'state',code:r.code,host:r.host,players:publicPlayers(r),status:r.status,round:r.round,drawer:r.drawer,category:r.category,endsAt:r.endsAt,answer:r.status==='reveal'?r.answer:null,strokes:r.strokes});if(r.status==='playing'){let d=r.players.find(p=>p.id===r.drawer);send(d?.ws,{type:'secret',word:r.answer})}}
+function resetTimer(r){if(r.timer)clearTimeout(r.timer);r.timer=null}
+function reveal(r,message){if(r.status!=='playing')return;resetTimer(r);r.status='reveal';r.endsAt=Date.now()+4500;broadcast(r,{type:'notice',text:message});sync(r);r.timer=setTimeout(()=>{r.timer=null;if(r.players.length>=2)nextRound(r);else{r.status='lobby';sync(r)}},4500)}
+function nextRound(r){resetTimer(r);if(r.players.length<2){r.status='lobby';sync(r);return}r.round++;r.drawerIndex=(r.drawerIndex+1)%r.players.length;r.drawer=r.players[r.drawerIndex].id;let choices=words.filter(x=>x.word!==r.answer);let item=choices[Math.floor(Math.random()*choices.length)];r.answer=item.word;r.category=item.category;r.strokes=[];r.status='playing';r.endsAt=Date.now()+60000;sync(r);r.timer=setTimeout(()=>reveal(r,'⏰ 60초 종료!'),60000)}
+function leave(ws){let r=rooms.get(ws.room);if(!r)return;const old=r.players.length;r.players=r.players.filter(p=>p.ws!==ws);if(old===r.players.length)return;if(!r.players.length){resetTimer(r);rooms.delete(r.code);return}if(r.host===ws.pid)r.host=r.players[0].id;if(r.status==='playing'&&r.drawer===ws.pid){resetTimer(r);r.drawerIndex=Math.max(-1,r.players.findIndex(p=>p.id===ws.pid)-1);nextRound(r)}else if(r.status!=='lobby'&&r.players.length<2){resetTimer(r);r.status='lobby';r.answer='';sync(r)}else{r.drawerIndex=Math.max(-1,r.players.findIndex(p=>p.id===r.drawer));sync(r)}ws.room=null}
+function code(){let s;do{s=randomBytes(3).toString('hex').toUpperCase()}while(rooms.has(s));return s}
+function error(ws,msg){send(ws,{type:'error',text:msg})}
+wss.on('connection',ws=>{ws.pid=randomUUID();ws.lastStroke=0;ws.on('message',raw=>{if(raw.length>6000)return;let m;try{m=JSON.parse(raw)}catch{return}if(!m||typeof m.type!=='string')return;
+if(m.type==='join'){leave(ws);const nick=String(m.nick||'').trim().slice(0,12);if(!nick)return error(ws,'닉네임을 입력해줘!');const avatar=Number(m.avatar);if(!Number.isInteger(avatar)||avatar<0||avatar>7)return;let r;if(m.code){r=rooms.get(String(m.code).toUpperCase());if(!r)return error(ws,'없는 방이야. 링크를 확인해줘!')}else{r={code:code(),players:[],host:ws.pid,status:'lobby',round:0,drawer:null,drawerIndex:-1,answer:'',category:'',endsAt:0,strokes:[],timer:null};rooms.set(r.code,r)}if(r.players.length>=12)return error(ws,'이 방은 최대 12명까지 입장할 수 있어!');ws.room=r.code;r.players.push({id:ws.pid,ws,nick,avatar,score:0});send(ws,{type:'joined',id:ws.pid,code:r.code});sync(r);return}
+let r=rooms.get(ws.room);if(!r)return;if(m.type==='start'){if(ws.pid!==r.host||r.status!=='lobby')return;if(r.players.length<2)return error(ws,'최소 2명이 있어야 시작할 수 있어!');r.round=0;r.drawerIndex=-1;r.players.forEach(p=>p.score=0);nextRound(r)}
+if(m.type==='stroke'){if(r.status!=='playing'||r.drawer!==ws.pid)return;if(Date.now()-ws.lastStroke<12)return;ws.lastStroke=Date.now();const s=m.stroke;if(!s||!['line','clear'].includes(s.kind))return;if(s.kind==='clear'){r.strokes=[];broadcast(r,{type:'draw',stroke:{kind:'clear'}});return}const vals=[s.x,s.y,s.px,s.py,s.width];if(!vals.every(v=>typeof v==='number'&&Number.isFinite(v))||vals.slice(0,4).some(v=>v<0||v>720)||s.width<1||s.width>40||!/^#[0-9a-fA-F]{6}$/.test(s.color))return;const stroke={kind:'line',x:s.x,y:s.y,px:s.px,py:s.py,width:s.width,color:s.color};if(r.strokes.length>7000)r.strokes.shift();r.strokes.push(stroke);broadcast(r,{type:'draw',stroke})}
+if(m.type==='chat'){if(r.status!=='playing'||r.drawer===ws.pid)return;const text=String(m.text||'').trim().slice(0,70);if(!text)return;const p=r.players.find(p=>p.id===ws.pid);if(!p)return;if(norm(text)===norm(r.answer)){p.score+=Math.max(10,Math.ceil((r.endsAt-Date.now())/1000));reveal(r,`🎉 ${p.nick} 정답!`)}else broadcast(r,{type:'chat',nick:p.nick,text})}
+});ws.on('close',()=>leave(ws))});
+setInterval(()=>{for(const r of rooms.values()){if(r.status==='lobby'&&r.players.length===0){resetTimer(r);rooms.delete(r.code)}}},60000).unref();
+server.listen(process.env.PORT||3000,'0.0.0.0',()=>console.log('Game ready'));
